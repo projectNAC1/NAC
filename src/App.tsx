@@ -26,8 +26,24 @@ type MasterKeyRecord = {
 
 type CheckleakStatus = {
   xdrInstalled: boolean;
-  kaseyaInstalled: boolean;
 };
+
+// type MergeContext = {
+//   rowNumber: number;
+//   keyRecord: MasterKeyRecord;
+//   rolloutRow: GenericRow | null;
+//   boardingMatch: GenericRow | null;
+//   softwareMatch: GenericRow | null;
+//   checkleakMatch: GenericRow | null;
+//   deviceMatchByMac: GenericRow | null;
+//   matchedDeviceBySerial: GenericRow | null;
+//   serialValue: string;
+//   candidateMacs: string[];
+//   boardingUsernameByMac: Map<string, string>;
+//   checkleakStatusByMac: Map<string, CheckleakStatus>;
+//   rolloutPnValue: string;
+//   rolloutMatchBySerial: GenericRow | null;
+// };
 
 type MergeContext = {
   rowNumber: number;
@@ -35,6 +51,8 @@ type MergeContext = {
   rolloutRow: GenericRow | null;
   boardingMatch: GenericRow | null;
   softwareMatch: GenericRow | null;
+  softwareMatchByMac: GenericRow | null;
+  softwareMatchBySerialNumber: GenericRow | null;
   checkleakMatch: GenericRow | null;
   deviceMatchByMac: GenericRow | null;
   matchedDeviceBySerial: GenericRow | null;
@@ -43,6 +61,7 @@ type MergeContext = {
   boardingUsernameByMac: Map<string, string>;
   checkleakStatusByMac: Map<string, CheckleakStatus>;
   rolloutPnValue: string;
+  rolloutMatchBySerial: GenericRow | null;
 };
 
 const FILE_KEYS = {
@@ -137,8 +156,9 @@ export default function App() {
         throw new Error("Built-in master template is empty.");
       }
 
-      const masterHeaders = extractHeaders(masterRowsRaw);
-
+      const masterHeaders = ensureDateHeaderAfterReasonNotComply(
+        extractHeaders(masterRowsRaw),
+      );
       setStatus("Preparing source data...");
       await pauseUi();
 
@@ -193,6 +213,14 @@ export default function App() {
         "lan mac",
       ]);
 
+      const softwareSerialKey = detectColumn(softwareRows, [
+        "serial number",
+        "serialnumber",
+        "sn",
+        "service tag",
+        "asset serial",
+        "bios serial number",
+      ]);
       const checkleakMacKey = detectColumn(checkleakRows, [
         "mac address",
         "mac",
@@ -248,6 +276,13 @@ export default function App() {
           normalizeMacKeys: true,
         },
       );
+      const softwareIndexBySerial = indexRowsByKeys(
+        softwareRows,
+        [softwareSerialKey],
+        {
+          normalizeMacKeys: false,
+        },
+      );
 
       const checkleakIndexByMac = indexRowsByKeys(
         checkleakRows,
@@ -293,6 +328,7 @@ export default function App() {
         rolloutSerialKey,
         rolloutMacKey,
         boardingMacKey,
+        softwareSerialKey,
         softwareMacKey,
         checkleakMacKey,
         deviceListSerialKey,
@@ -368,10 +404,31 @@ export default function App() {
 
           const boardingMatch = boardingMatchByPn || boardingMatchByMac;
 
-          const softwareMatch = findFirstMacMatch(
+          // const softwareMatchBySerial =
+          //   keyRecord.serial && softwareIndexBySerial.has(keyRecord.serial)
+          //     ? (softwareIndexBySerial.get(keyRecord.serial) ?? null)
+          //     : null;
+
+          // const softwareMatchByMac = findFirstMacMatch(
+          //   candidateMacs,
+          //   softwareIndexByMac,
+          // );
+
+          // const softwareMatch = softwareMatchBySerial || softwareMatchByMac;
+
+          const softwareMatchBySerialNumber =
+            keyRecord.serial && softwareIndexBySerial.has(keyRecord.serial)
+              ? (softwareIndexBySerial.get(keyRecord.serial) ?? null)
+              : null;
+
+          const softwareMatchByMac = findFirstMacMatch(
             candidateMacs,
             softwareIndexByMac,
           );
+
+          const softwareMatch =
+            softwareMatchBySerialNumber || softwareMatchByMac;
+
           const checkleakMatch = findFirstMacMatch(
             candidateMacs,
             checkleakIndexByMac,
@@ -395,8 +452,11 @@ export default function App() {
               rowNumber: index + 1,
               keyRecord,
               rolloutRow,
+              rolloutMatchBySerial: rolloutBySerial,
               boardingMatch,
               softwareMatch,
+              softwareMatchByMac, // new
+              softwareMatchBySerialNumber, // new
               checkleakMatch,
               deviceMatchByMac,
               matchedDeviceBySerial,
@@ -508,7 +568,7 @@ export default function App() {
           <br />
           - Divisi by Grouping from Software Installation Department Name
           <br />
-          - XDR / KASEYA from Checkleak Vulnerability description
+          - XDR from Checkleak Vulnerability description
           <br />
           - Empty values become #N/A
           <br />- Invalid MACs are ignored
@@ -675,6 +735,32 @@ function extractHeaders(rows: GenericRow[]) {
   return headers.length ? headers : ["Serial Number", "MAC Address"];
 }
 
+function ensureDateHeaderAfterReasonNotComply(headers: string[]) {
+  const cleanedHeaders = headers.filter(
+    (header) => normalizeHeader(header) !== "tgl",
+  );
+
+  const existingDateHeader = cleanedHeaders.find(
+    (header) => normalizeHeader(header) === "date",
+  );
+
+  const reasonIndex = cleanedHeaders.findIndex(
+    (header) => normalizeHeader(header) === "reasonnotcomply",
+  );
+
+  if (reasonIndex === -1) {
+    if (existingDateHeader) return cleanedHeaders;
+    return [...cleanedHeaders, "Date"];
+  }
+
+  const withoutDate = cleanedHeaders.filter(
+    (header) => normalizeHeader(header) !== "date",
+  );
+
+  withoutDate.splice(reasonIndex + 1, 0, existingDateHeader || "Date");
+  return withoutDate;
+}
+
 function normalizeHeader(value: unknown) {
   return String(value ?? "")
     .toLowerCase()
@@ -751,6 +837,66 @@ function formatMacForOutput(value: unknown) {
 
   const parts = cleaned.match(/.{1,2}/g);
   return parts ? parts.join(":") : "";
+}
+
+function formatDateOnly(value: unknown) {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return "";
+  }
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return formatDateParts(
+      value.getFullYear(),
+      value.getMonth() + 1,
+      value.getDate(),
+    );
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const parsed = XLSX.SSF.parse_date_code(value);
+    if (parsed) {
+      return formatDateParts(parsed.y, parsed.m, parsed.d);
+    }
+  }
+
+  const text = String(value).trim();
+  if (!text) return "";
+
+  const pureDateMatch = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (pureDateMatch) {
+    return formatDateParts(
+      Number(pureDateMatch[1]),
+      Number(pureDateMatch[2]),
+      Number(pureDateMatch[3]),
+    );
+  }
+
+  const ddmmyyyyMatch = text.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+  if (ddmmyyyyMatch) {
+    return formatDateParts(
+      Number(ddmmyyyyMatch[3]),
+      Number(ddmmyyyyMatch[2]),
+      Number(ddmmyyyyMatch[1]),
+    );
+  }
+
+  const parsedDate = new Date(text);
+  if (!Number.isNaN(parsedDate.getTime())) {
+    return formatDateParts(
+      parsedDate.getFullYear(),
+      parsedDate.getMonth() + 1,
+      parsedDate.getDate(),
+    );
+  }
+
+  return text.split(" ")[0];
+}
+
+function formatDateParts(year: number, month: number, day: number) {
+  const yyyy = String(year).padStart(4, "0");
+  const mm = String(month).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  return `${dd}-${mm}-${yyyy}`;
 }
 
 function dedupeStrings(values: Array<string | null | undefined>) {
@@ -920,7 +1066,6 @@ function buildCheckleakStatusIndex(rows: GenericRow[], macKey: string | null) {
     if (!map.has(mac)) {
       map.set(mac, {
         xdrInstalled: false,
-        kaseyaInstalled: false,
       });
     }
 
@@ -932,10 +1077,6 @@ function buildCheckleakStatusIndex(rows: GenericRow[], macKey: string | null) {
       vuln.includes("ALREADY INSTALLED")
     ) {
       status.xdrInstalled = true;
-    }
-
-    if (vuln.includes("KASEYA") && vuln.includes("ALREADY INSTALLED")) {
-      status.kaseyaInstalled = true;
     }
   }
 
@@ -1015,6 +1156,7 @@ function buildMasterKeys(params: {
   rolloutSerialKey: string | null;
   rolloutMacKey: string | null;
   boardingMacKey: string | null;
+  softwareSerialKey: string | null;
   softwareMacKey: string | null;
   checkleakMacKey: string | null;
   deviceListSerialKey: string | null;
@@ -1062,7 +1204,10 @@ function buildMasterKeys(params: {
   }
 
   for (const row of params.softwareRows) {
-    addIdentity("", getCell(row, params.softwareMacKey));
+    addIdentity(
+      getCell(row, params.softwareSerialKey),
+      getCell(row, params.softwareMacKey),
+    );
   }
 
   for (const row of params.checkleakRows) {
@@ -1175,7 +1320,6 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
 
   const mergedCheckleakStatus = {
     xdrInstalled: false,
-    kaseyaInstalled: false,
   };
 
   for (const mac of context.candidateMacs || []) {
@@ -1183,7 +1327,6 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
     if (!status) continue;
 
     if (status.xdrInstalled) mergedCheckleakStatus.xdrInstalled = true;
-    if (status.kaseyaInstalled) mergedCheckleakStatus.kaseyaInstalled = true;
   }
 
   if (headerNorm === "no" || headerNorm === "number") {
@@ -1239,6 +1382,19 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
     return "";
   }
 
+  if (headerNorm === "fullname") {
+    return (
+      getValueFromRow(context.rolloutMatchBySerial, [
+        "full name",
+        "fullname",
+        "employee name",
+        "name",
+        "user name",
+        "username",
+      ]) || ""
+    );
+  }
+
   if (headerNorm === "checkboarding") {
     return context.boardingMatch ? "Posturing+Boarding" : "No Boarding";
   }
@@ -1268,11 +1424,37 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
 
     return "Posturing+Boarding";
   }
-
   if (headerNorm === "divisibygrouping") {
-    return findAnyValue(
-      [context.softwareMatch],
-      ["department name", "departmentname", "department"],
+    return (
+      findAnyValue(
+        [context.softwareMatch],
+        ["department name", "departmentname", "department"],
+      ) ||
+      findAnyValue(
+        [context.softwareMatchByMac],
+        ["department name", "departmentname", "department"],
+      ) ||
+      findAnyValue(
+        [context.softwareMatchBySerialNumber],
+        ["department name", "departmentname", "department"],
+      ) ||
+      getValueFromRow(context.deviceMatchByMac, [
+        "department/unit of device",
+        "department unit of device",
+      ]) ||
+      getValueFromRow(context.matchedDeviceBySerial, [
+        "department/unit of device",
+        "department unit of device",
+      ]) ||
+      getValueFromRow([context.rolloutRow], ["Lokasi New"]) ||
+      findAnyValue(
+        [context.checkleakMatch],
+        ["department name", "departmentname", "department"],
+      ) ||
+      findAnyValue(
+        [context.checkleakStatusByMac],
+        ["department name", "departmentname", "department"],
+      )
     );
   }
 
@@ -1282,61 +1464,115 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
       : "Not install";
   }
 
-  if (headerNorm === "kaseya") {
-    return mergedCheckleakStatus.kaseyaInstalled
-      ? "Kaseya already installed"
-      : "Not install";
+  if (headerNorm === "reasonnotcomply") {
+    const isXdrInstalled = mergedCheckleakStatus.xdrInstalled;
+
+    const isBoarding =
+      context.boardingMatch ||
+      String(context.rolloutPnValue ?? "").trim() !== "";
+
+    if (!isBoarding) {
+      return "No Boarding";
+    }
+
+    if (!isXdrInstalled) {
+      return "Not install XDR";
+    }
+
+    return "Comply";
   }
 
-  if (headerNorm === "reasonnotcomply") {
-    const xdrValue = mergedCheckleakStatus.xdrInstalled
-      ? "Cortex XDR already installed"
-      : "Not install";
+  if (headerNorm === "date" || headerNorm === "tgl") {
+    // const rawDate = findAnyValue(sourcePriority, [
+    //   "date",
+    //   "tgl",
+    //   "tanggal",
+    //   "created date",
+    //   "createddate",
+    //   "updated date",
+    //   "updateddate",
+    //   "scan date",
+    //   "scandate",
+    //   "report date",
+    //   "reportdate",
+    //   "install date",
+    //   "installdate",
+    // ]);
+    const rawDate =
+      findAnyValue(
+        [context.boardingMatch],
+        [
+          "date",
+          "tgl",
+          "tanggal",
+          "created date",
+          "createddate",
+          "time",
+          "datetime",
+        ],
+      ) ||
+      findAnyValue(sourcePriority, [
+        "date",
+        "tgl",
+        "tanggal",
+        "created date",
+        "createddate",
+        "time",
+        "datetime",
+      ]);
 
-    const kaseyaValue = mergedCheckleakStatus.kaseyaInstalled
-      ? "Kaseya already installed"
-      : "Not install";
+    return formatDateOnly(rawDate);
+  }
 
-    const posturingBoardingValue =
-      context.boardingMatch ||
-      String(context.rolloutPnValue ?? "").trim() !== ""
-        ? "Boarding"
-        : "No Boarding";
+  if (
+    headerNorm === "ostype" ||
+    headerNorm === "os" ||
+    headerNorm === "devicetype"
+  ) {
+    const rawType =
+      getValueFromRow(context.boardingMatch, [
+        "Operating System",
+        "device type",
+        "platform",
+        "os",
+      ]) || findAnyValue(sourcePriority, ["device type", "platform", "os"]);
+    // const rawType =
+    //   getValueFromRow(context.softwareMatch, [
+    //     "Operating System",
+    //     "device type",
+    //     "platform",
+    //     "os",
+    //   ]) ||
+    //   getValueFromRow(context.boardingMatch, [
+    //     "Operating System",
+    //     "device type",
+    //     "platform",
+    //     "os",
+    //   ]);
+    // findAnyValue(sourcePriority, ["device type", "platform", "os"]);
 
-    if (
-      xdrValue === "Cortex XDR already installed" &&
-      kaseyaValue === "Kaseya already installed"
-    ) {
-      return posturingBoardingValue === "No Boarding"
-        ? "Not Boarding"
-        : "Comply";
-    }
+    const value = String(rawType || "")
+      .trim()
+      .toLowerCase();
 
-    if (
-      xdrValue === "Cortex XDR already installed" &&
-      kaseyaValue === "Not install"
-    ) {
-      return posturingBoardingValue === "No Boarding"
-        ? "Not Boarding"
-        : "Not install Kaseya";
-    }
+    if (!value) return "";
 
-    if (
-      xdrValue === "Not install" &&
-      kaseyaValue === "Kaseya already installed"
-    ) {
-      return posturingBoardingValue === "No Boarding"
-        ? "Not Boarding"
-        : "Not install XDR";
-    }
+    if (value.includes("android")) return "Android";
+    if (value.includes("ios") && value.includes("mac")) return "MacOS/IOS";
+    if (value.includes("ios")) return "IOS";
+    if (value.includes("mac")) return "MacOS";
+    if (value.includes("windows")) return "Windows";
+    if (value.includes("server")) return "Server";
+    if (value.includes("laptop")) return "Laptop";
+    return value;
+  }
 
-    if (xdrValue === "Not install" && kaseyaValue === "Not install") {
-      return posturingBoardingValue === "No Boarding"
-        ? "Not Boarding"
-        : "Not install XDR and KASEYA";
-    }
-
-    return "Not Comply";
+  if (headerNorm === "hostname") {
+    return (
+      getValueFromRow(context.deviceMatchByMac, ["hostname", "device name"]) ||
+      getValueFromRow(context.softwareMatch, ["hostname", "device name"]) ||
+      getValueFromRow(context.rolloutRow, ["hostname device"])
+    );
   }
 
   const exactValue = findMatchingHeaderValue(header, sourcePriority);
