@@ -21,7 +21,12 @@ type SheetRows = {
 type MasterKeyRecord = {
   key: string;
   serial: string;
-  mac: string; // compare format: AABBCCDDEEFF
+  mac: string;
+};
+
+type CheckleakStatus = {
+  xdrInstalled: boolean;
+  kaseyaInstalled: boolean;
 };
 
 type MergeContext = {
@@ -36,6 +41,8 @@ type MergeContext = {
   serialValue: string;
   candidateMacs: string[];
   boardingUsernameByMac: Map<string, string>;
+  checkleakStatusByMac: Map<string, CheckleakStatus>;
+  rolloutPnValue: string;
 };
 
 const FILE_KEYS = {
@@ -144,20 +151,33 @@ export default function App() {
       const rolloutSerialKey = detectColumn(rolloutRows, [
         "serial number",
         "serialnumber",
+        "serial number laptop / merk handphone",
         "sn",
         "service tag",
         "asset serial",
+        "bios serial number",
       ]);
 
       const rolloutMacKey = detectColumn(rolloutRows, [
         "mac address",
+        "mac address laptop / handphone",
         "mac",
         "wifi mac",
         "wireless mac",
         "lan mac",
       ]);
 
+      const rolloutPnKey = detectColumn(rolloutRows, [
+        "pn",
+        "personal number",
+        "personnel number",
+        "nik",
+        "employee id",
+        "employee number",
+      ]);
+
       const boardingMacKey = detectColumn(boardingRows, [
+        "mac address of the terminal",
         "mac address",
         "mac",
         "wifi mac",
@@ -190,6 +210,7 @@ export default function App() {
       ]);
 
       const deviceListSerialKey = detectColumn(deviceListRows, [
+        "bios serial number",
         "serial number",
         "serialnumber",
         "sn",
@@ -236,6 +257,11 @@ export default function App() {
         },
       );
 
+      const checkleakStatusByMac = buildCheckleakStatusIndex(
+        checkleakRows,
+        checkleakMacKey,
+      );
+
       const deviceListIndexByMac = indexRowsByKeys(
         deviceListRows,
         [deviceListMacKey],
@@ -253,8 +279,9 @@ export default function App() {
       );
 
       const boardingUsernameByMac = buildBoardingUsernameIndex(boardingRows);
+      const boardingIndexByPn = buildBoardingPnIndex(boardingRows);
 
-      setStatus("Building union of all keys...");
+      setStatus("Building unified device identities...");
       await pauseUi();
 
       const masterKeys = buildMasterKeys({
@@ -276,7 +303,9 @@ export default function App() {
         throw new Error("No usable rows found in uploaded files.");
       }
 
-      setStatus(`Combining ${masterKeys.length} rows into master.xlsx...`);
+      setStatus(
+        `Combining ${masterKeys.length} unified rows into master.xlsx...`,
+      );
       await pauseUi();
 
       const combinedRows: GenericRow[] = [];
@@ -307,13 +336,38 @@ export default function App() {
 
           const candidateMacs = dedupeStrings([
             keyRecord.mac,
-            ...collectPossibleMacs([rolloutRow, matchedDeviceBySerial]),
+            ...collectPossibleMacs([
+              rolloutRow,
+              matchedDeviceBySerial,
+              rolloutByMac,
+              rolloutBySerial,
+            ]),
           ]);
 
-          const boardingMatch = findFirstMacMatch(
+          const rolloutPnValue = normalizePn(
+            getValueFromRow(rolloutRow, [
+              rolloutPnKey || "",
+              "pn",
+              "personal number",
+              "personnel number",
+              "nik",
+              "employee id",
+              "employee number",
+            ]),
+          );
+
+          const boardingMatchByMac = findFirstMacMatch(
             candidateMacs,
             boardingIndexByMac,
           );
+
+          const boardingMatchByPn =
+            rolloutPnValue && boardingIndexByPn.has(rolloutPnValue)
+              ? (boardingIndexByPn.get(rolloutPnValue) ?? null)
+              : null;
+
+          const boardingMatch = boardingMatchByPn || boardingMatchByMac;
+
           const softwareMatch = findFirstMacMatch(
             candidateMacs,
             softwareIndexByMac,
@@ -349,6 +403,8 @@ export default function App() {
               serialValue,
               candidateMacs,
               boardingUsernameByMac,
+              checkleakStatusByMac,
+              rolloutPnValue,
             });
           }
 
@@ -363,14 +419,19 @@ export default function App() {
         await pauseUi();
       }
 
-      setStatus("Sorting rows (move #N/A to bottom)...");
+      setStatus("Final dedupe by device...");
       await pauseUi();
 
-      // ✅ SORT HERE
-      const sortedRows = sortRowsByQuality(combinedRows);
+      const dedupedRows = dedupeFinalRowsByDevice(combinedRows);
+
+      setStatus("Sorting rows...");
+      await pauseUi();
+
+      const sortedRows = sortRowsByQuality(dedupedRows);
       sortedRows.forEach((row, index) => {
         row["No"] = index + 1;
       });
+
       setStatus("Writing Excel file...");
       await pauseUi();
 
@@ -391,7 +452,7 @@ export default function App() {
       });
 
       saveAs(blob, "master.xlsx");
-      setStatus(`Done. Exported ${combinedRows.length} rows to master.xlsx`);
+      setStatus(`Done. Exported ${sortedRows.length} rows to master.xlsx`);
     } catch (error) {
       console.error(error);
       setStatus(
@@ -437,8 +498,20 @@ export default function App() {
           <br />
           - Output MAC uses ":"
           <br />
-          - PN comes from Boarding Username
-          <br />- Empty values become #N/A
+          - PN compare from Rollout and Boarding
+          <br />
+          - Boarding matched by PN first, MAC fallback
+          <br />
+          - 1 PN can have many devices
+          <br />
+          - Final output dedupe by device only
+          <br />
+          - Divisi by Grouping from Software Installation Department Name
+          <br />
+          - XDR / KASEYA from Checkleak Vulnerability description
+          <br />
+          - Empty values become #N/A
+          <br />- Invalid MACs are ignored
         </p>
 
         <div style={styles.notice}>
@@ -540,6 +613,10 @@ async function readAllSheets(file: File): Promise<SheetRows[]> {
       rows = XLSX.utils.sheet_to_json(sheet, { defval: "", range: 2 });
     }
 
+    if (!looksLikeRealData(rows)) {
+      rows = XLSX.utils.sheet_to_json(sheet, { defval: "", range: 3 });
+    }
+
     return {
       sheetName,
       rows: cleanupRows(rows),
@@ -553,9 +630,17 @@ function looksLikeRealData(rows: GenericRow[]) {
   const keys = Object.keys(rows[0] || {}).map((k) => normalizeHeader(k));
 
   return keys.some((k) =>
-    ["mac", "macaddress", "username", "serialnumber", "sn"].some((x) =>
-      k.includes(x),
-    ),
+    [
+      "mac",
+      "macaddress",
+      "username",
+      "serialnumber",
+      "sn",
+      "personalnumber",
+      "vulnerabilitydescription",
+      "device",
+      "departmentname",
+    ].some((x) => k.includes(x)),
   );
 }
 
@@ -600,7 +685,7 @@ function detectColumn(rows: GenericRow[], possibleNames: string[]) {
   if (!rows.length) return null;
 
   const allKeys = new Set<string>();
-  for (const row of rows.slice(0, 50)) {
+  for (const row of rows.slice(0, 100)) {
     Object.keys(row).forEach((k) => allKeys.add(k));
   }
 
@@ -628,13 +713,35 @@ function normalizeText(value: unknown) {
     .toUpperCase();
 }
 
+function normalizeSerialForCompare(value: unknown) {
+  return normalizeText(value);
+}
+
+function normalizePn(value: unknown) {
+  const text = String(value ?? "")
+    .trim()
+    .toUpperCase();
+  if (!text) return "";
+
+  const base = text.includes("@") ? text.split("@")[0] : text;
+  const compact = base.replace(/\s+/g, "");
+
+  // numeric PN: remove leading zeros
+  if (/^\d+$/.test(compact)) {
+    return compact.replace(/^0+/, "") || "0";
+  }
+
+  return compact;
+}
 function normalizeMacForCompare(value: unknown) {
   if (!value) return "";
 
-  return String(value)
+  const cleaned = String(value)
     .trim()
     .replace(/[^a-fA-F0-9]/g, "")
     .toUpperCase();
+
+  return cleaned.length === 12 ? cleaned : "";
 }
 
 function formatMacForOutput(value: unknown) {
@@ -682,7 +789,7 @@ function indexRowsByKeys(
       const raw = getCell(row, key);
       const normalized = options.normalizeMacKeys
         ? normalizeMacForCompare(raw)
-        : normalizeText(raw);
+        : normalizeSerialForCompare(raw);
 
       if (!normalized) continue;
 
@@ -737,7 +844,14 @@ function buildBoardingUsernameIndex(boardingRows: GenericRow[]) {
   const map = new Map<string, string>();
 
   for (const row of boardingRows) {
-    const username = getValueFromRow(row, ["username"]);
+    const username = getValueFromRow(row, [
+      "user name",
+      "username",
+      "name",
+      "email",
+      "user",
+      "login",
+    ]);
     if (!username) continue;
 
     const macs = collectPossibleMacs([row]);
@@ -745,6 +859,83 @@ function buildBoardingUsernameIndex(boardingRows: GenericRow[]) {
       if (mac && !map.has(mac)) {
         map.set(mac, String(username));
       }
+    }
+  }
+
+  return map;
+}
+
+function buildBoardingPnIndex(boardingRows: GenericRow[]) {
+  const map = new Map<string, GenericRow>();
+
+  for (const row of boardingRows) {
+    const rawPn = getValueFromRow(row, [
+      "user name",
+      "username",
+      "name",
+      "email",
+      "user",
+      "login",
+    ]);
+
+    const pn = normalizePn(rawPn);
+    if (!pn) continue;
+
+    const existing = map.get(pn);
+
+    if (!existing) {
+      map.set(pn, row);
+      continue;
+    }
+
+    const existingScore = countFilledValues(existing);
+    const currentScore = countFilledValues(row);
+
+    if (currentScore >= existingScore) {
+      map.set(pn, row);
+    }
+  }
+
+  return map;
+}
+
+function buildCheckleakStatusIndex(rows: GenericRow[], macKey: string | null) {
+  const map = new Map<string, CheckleakStatus>();
+
+  if (!macKey) return map;
+
+  for (const row of rows) {
+    const mac = normalizeMacForCompare(getCell(row, macKey));
+    if (!mac) continue;
+
+    const vuln = String(
+      getValueFromRow(row, [
+        "vulnerability description",
+        "vulnerabilitydescription",
+      ]) ?? "",
+    )
+      .trim()
+      .toUpperCase();
+
+    if (!map.has(mac)) {
+      map.set(mac, {
+        xdrInstalled: false,
+        kaseyaInstalled: false,
+      });
+    }
+
+    const status = map.get(mac)!;
+
+    if (
+      vuln.includes("CORTEX") &&
+      vuln.includes("XDR") &&
+      vuln.includes("ALREADY INSTALLED")
+    ) {
+      status.xdrInstalled = true;
+    }
+
+    if (vuln.includes("KASEYA") && vuln.includes("ALREADY INSTALLED")) {
+      status.kaseyaInstalled = true;
     }
   }
 
@@ -767,6 +958,54 @@ function withNA(value: unknown) {
   return value;
 }
 
+class DisjointSet {
+  private parent = new Map<string, string>();
+  private rank = new Map<string, number>();
+
+  add(x: string) {
+    if (!this.parent.has(x)) {
+      this.parent.set(x, x);
+      this.rank.set(x, 0);
+    }
+  }
+
+  find(x: string): string {
+    this.add(x);
+    const parent = this.parent.get(x)!;
+
+    if (parent !== x) {
+      const root = this.find(parent);
+      this.parent.set(x, root);
+      return root;
+    }
+
+    return x;
+  }
+
+  union(a: string, b: string) {
+    const rootA = this.find(a);
+    const rootB = this.find(b);
+
+    if (rootA === rootB) return;
+
+    const rankA = this.rank.get(rootA) ?? 0;
+    const rankB = this.rank.get(rootB) ?? 0;
+
+    if (rankA < rankB) {
+      this.parent.set(rootA, rootB);
+      return;
+    }
+
+    if (rankA > rankB) {
+      this.parent.set(rootB, rootA);
+      return;
+    }
+
+    this.parent.set(rootB, rootA);
+    this.rank.set(rootA, rankA + 1);
+  }
+}
+
 function buildMasterKeys(params: {
   rolloutRows: GenericRow[];
   boardingRows: GenericRow[];
@@ -781,70 +1020,150 @@ function buildMasterKeys(params: {
   deviceListSerialKey: string | null;
   deviceListMacKey: string | null;
 }) {
-  const map = new Map<string, MasterKeyRecord>();
+  const dsu = new DisjointSet();
 
-  const addRecord = (serial: string, mac: string) => {
-    const normalizedSerial = normalizeText(serial);
-    const normalizedMac = normalizeMacForCompare(mac);
-    const key = normalizedSerial || normalizedMac;
+  const identities: Array<{
+    serial: string;
+    mac: string;
+  }> = [];
 
-    if (!key) return;
+  const addIdentity = (serialRaw: unknown, macRaw: unknown) => {
+    const serial = normalizeSerialForCompare(serialRaw);
+    const mac = normalizeMacForCompare(macRaw);
 
-    const existing = map.get(key);
+    if (!serial && !mac) return;
 
-    if (!existing) {
-      map.set(key, {
-        key,
-        serial: normalizedSerial,
-        mac: normalizedMac,
-      });
-      return;
-    }
+    const serialNode = serial ? `S:${serial}` : "";
+    const macNode = mac ? `M:${mac}` : "";
 
-    if (!existing.serial && normalizedSerial)
-      existing.serial = normalizedSerial;
-    if (!existing.mac && normalizedMac) existing.mac = normalizedMac;
+    if (serialNode) dsu.add(serialNode);
+    if (macNode) dsu.add(macNode);
+    if (serialNode && macNode) dsu.union(serialNode, macNode);
+
+    identities.push({ serial, mac });
   };
 
-  // Priority order for structure:
-  // 1. Device List
   for (const row of params.deviceListRows) {
-    addRecord(
+    addIdentity(
       getCell(row, params.deviceListSerialKey),
       getCell(row, params.deviceListMacKey),
     );
   }
 
-  // 2. Software
-  for (const row of params.softwareRows) {
-    addRecord("", getCell(row, params.softwareMacKey));
-  }
-
-  // 3. Checkleak
-  for (const row of params.checkleakRows) {
-    addRecord("", getCell(row, params.checkleakMacKey));
-  }
-
-  // 4. Boarding
-  for (const row of params.boardingRows) {
-    addRecord("", getCell(row, params.boardingMacKey));
-  }
-
-  // 5. Rollout last
   for (const row of params.rolloutRows) {
-    addRecord(
+    addIdentity(
       getCell(row, params.rolloutSerialKey),
       getCell(row, params.rolloutMacKey),
     );
   }
 
-  return [...map.values()];
+  for (const row of params.boardingRows) {
+    addIdentity("", getCell(row, params.boardingMacKey));
+  }
+
+  for (const row of params.softwareRows) {
+    addIdentity("", getCell(row, params.softwareMacKey));
+  }
+
+  for (const row of params.checkleakRows) {
+    addIdentity("", getCell(row, params.checkleakMacKey));
+  }
+
+  const groups = new Map<
+    string,
+    {
+      serials: Set<string>;
+      macs: Set<string>;
+    }
+  >();
+
+  for (const item of identities) {
+    const node = item.serial ? `S:${item.serial}` : `M:${item.mac}`;
+    const root = dsu.find(node);
+
+    if (!groups.has(root)) {
+      groups.set(root, {
+        serials: new Set<string>(),
+        macs: new Set<string>(),
+      });
+    }
+
+    const group = groups.get(root)!;
+
+    if (item.serial) group.serials.add(item.serial);
+    if (item.mac) group.macs.add(item.mac);
+  }
+
+  const result: MasterKeyRecord[] = [];
+
+  for (const [root, group] of groups.entries()) {
+    const serial = chooseBestSerial([...group.serials]);
+    const mac = chooseBestMac([...group.macs]);
+
+    result.push({
+      key: root,
+      serial,
+      mac,
+    });
+  }
+
+  return result.sort((a, b) => {
+    const aScore = Number(Boolean(a.serial)) + Number(Boolean(a.mac));
+    const bScore = Number(Boolean(b.serial)) + Number(Boolean(b.mac));
+
+    if (bScore !== aScore) return bScore - aScore;
+    if (a.serial !== b.serial) return a.serial.localeCompare(b.serial);
+    return a.mac.localeCompare(b.mac);
+  });
+}
+
+function chooseBestSerial(serials: string[]) {
+  if (!serials.length) return "";
+  return [...serials].sort(
+    (a, b) => b.length - a.length || a.localeCompare(b),
+  )[0];
+}
+
+function chooseBestMac(macs: string[]) {
+  if (!macs.length) return "";
+  return [...macs].sort()[0];
+}
+
+function dedupeFinalRowsByDevice(rows: GenericRow[]) {
+  const bestByKey = new Map<string, GenericRow>();
+
+  for (const row of rows) {
+    const serial = normalizeText(
+      row["Serial Number"] ?? row["serial number"] ?? row["SN"] ?? "",
+    );
+    const mac = normalizeMacForCompare(
+      row["MAC Address"] ?? row["mac address"] ?? row["MAC"] ?? "",
+    );
+
+    const key = serial || mac;
+    if (!key) continue;
+
+    const existing = bestByKey.get(key);
+
+    if (!existing) {
+      bestByKey.set(key, row);
+      continue;
+    }
+
+    const existingScore = countFilledValues(existing);
+    const currentScore = countFilledValues(row);
+
+    if (currentScore >= existingScore) {
+      bestByKey.set(key, row);
+    }
+  }
+
+  return [...bestByKey.values()];
 }
 
 function pickValueForMasterHeader(header: string, context: MergeContext) {
   const headerNorm = normalizeHeader(header);
 
-  // Rollout last priority
   const sourcePriority: Array<GenericRow | null> = [
     context.deviceMatchByMac,
     context.matchedDeviceBySerial,
@@ -853,6 +1172,19 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
     context.boardingMatch,
     context.rolloutRow,
   ];
+
+  const mergedCheckleakStatus = {
+    xdrInstalled: false,
+    kaseyaInstalled: false,
+  };
+
+  for (const mac of context.candidateMacs || []) {
+    const status = context.checkleakStatusByMac.get(mac);
+    if (!status) continue;
+
+    if (status.xdrInstalled) mergedCheckleakStatus.xdrInstalled = true;
+    if (status.kaseyaInstalled) mergedCheckleakStatus.kaseyaInstalled = true;
+  }
 
   if (headerNorm === "no" || headerNorm === "number") {
     return context.rowNumber;
@@ -872,6 +1204,7 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
             "serialnumber",
             "sn",
             "service tag",
+            "bios serial number",
           ]);
 
     return serialCandidate;
@@ -883,6 +1216,8 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
       context.keyRecord.mac ||
       findAnyValue(sourcePriority, [
         "mac address",
+        "mac address laptop / handphone",
+        "mac address of the terminal",
         "mac",
         "wifi mac",
         "wireless mac",
@@ -893,11 +1228,115 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
   }
 
   if (headerNorm === "pn") {
+    const rolloutPn = normalizePn(context.rolloutPnValue);
+    if (rolloutPn) return rolloutPn;
+
     for (const mac of context.candidateMacs || []) {
-      const username = context.boardingUsernameByMac.get(mac);
-      if (String(username ?? "").trim() !== "") return username;
+      const username = normalizePn(context.boardingUsernameByMac.get(mac));
+      if (username) return username;
     }
+
     return "";
+  }
+
+  if (headerNorm === "checkboarding") {
+    return context.boardingMatch ? "Posturing+Boarding" : "No Boarding";
+  }
+
+  if (headerNorm === "checkboardingonmanual") {
+    return String(context.rolloutPnValue ?? "").trim() !== ""
+      ? "Posturing+Boarding"
+      : "No Boarding";
+  }
+
+  if (headerNorm === "posturingboarding") {
+    const checkBoardingValue = context.boardingMatch
+      ? "Posturing+Boarding"
+      : "No Boarding";
+
+    const checkBoardingManualValue =
+      String(context.rolloutPnValue ?? "").trim() !== ""
+        ? "Posturing+Boarding"
+        : "No Boarding";
+
+    if (
+      checkBoardingValue === "No Boarding" &&
+      checkBoardingManualValue === "No Boarding"
+    ) {
+      return "No Boarding";
+    }
+
+    return "Posturing+Boarding";
+  }
+
+  if (headerNorm === "divisibygrouping") {
+    return findAnyValue(
+      [context.softwareMatch],
+      ["department name", "departmentname", "department"],
+    );
+  }
+
+  if (headerNorm === "xdr") {
+    return mergedCheckleakStatus.xdrInstalled
+      ? "Cortex XDR already installed"
+      : "Not install";
+  }
+
+  if (headerNorm === "kaseya") {
+    return mergedCheckleakStatus.kaseyaInstalled
+      ? "Kaseya already installed"
+      : "Not install";
+  }
+
+  if (headerNorm === "reasonnotcomply") {
+    const xdrValue = mergedCheckleakStatus.xdrInstalled
+      ? "Cortex XDR already installed"
+      : "Not install";
+
+    const kaseyaValue = mergedCheckleakStatus.kaseyaInstalled
+      ? "Kaseya already installed"
+      : "Not install";
+
+    const posturingBoardingValue =
+      context.boardingMatch ||
+      String(context.rolloutPnValue ?? "").trim() !== ""
+        ? "Boarding"
+        : "No Boarding";
+
+    if (
+      xdrValue === "Cortex XDR already installed" &&
+      kaseyaValue === "Kaseya already installed"
+    ) {
+      return posturingBoardingValue === "No Boarding"
+        ? "Not Boarding"
+        : "Comply";
+    }
+
+    if (
+      xdrValue === "Cortex XDR already installed" &&
+      kaseyaValue === "Not install"
+    ) {
+      return posturingBoardingValue === "No Boarding"
+        ? "Not Boarding"
+        : "Not install Kaseya";
+    }
+
+    if (
+      xdrValue === "Not install" &&
+      kaseyaValue === "Kaseya already installed"
+    ) {
+      return posturingBoardingValue === "No Boarding"
+        ? "Not Boarding"
+        : "Not install XDR";
+    }
+
+    if (xdrValue === "Not install" && kaseyaValue === "Not install") {
+      return posturingBoardingValue === "No Boarding"
+        ? "Not Boarding"
+        : "Not install XDR and KASEYA";
+    }
+
+    return "Not Comply";
   }
 
   const exactValue = findMatchingHeaderValue(header, sourcePriority);
@@ -939,6 +1378,8 @@ function getValueFromRow(row: GenericRow | null, possibleHeaders: string[]) {
 
     for (const header of possibleHeaders) {
       const headerNorm = normalizeHeader(header);
+
+      if (!headerNorm) continue;
 
       if (
         keyNorm === headerNorm ||
@@ -1007,16 +1448,6 @@ function findAnyValue(
   return "";
 }
 
-function sortRowsByNA(rows: GenericRow[]) {
-  return rows.sort((a, b) => {
-    const countNA = (row: GenericRow) =>
-      Object.values(row).filter((v) => String(v).toUpperCase() === "#N/A")
-        .length;
-
-    return countNA(a) - countNA(b); // fewer N/A first
-  });
-}
-
 function sortRowsByQuality(rows: GenericRow[]) {
   return rows.sort((a, b) => {
     const score = (row: GenericRow) =>
@@ -1024,43 +1455,7 @@ function sortRowsByQuality(rows: GenericRow[]) {
         (v) => String(v).trim() !== "" && String(v).toUpperCase() !== "#N/A",
       ).length;
 
-    return score(b) - score(a); // highest quality first
-  });
-}
-
-function sortByColumns(rows: GenericRow[]) {
-  const normalize = (value: unknown) => {
-    const text = String(value ?? "")
-      .trim()
-      .toUpperCase();
-    return text === "" || text === "#N/A" ? "ZZZZZZZZ" : text;
-  };
-
-  const getValue = (row: GenericRow, keys: string[]) => {
-    for (const key of keys) {
-      if (row[key] !== undefined) return row[key];
-    }
-    return "";
-  };
-
-  return rows.sort((a, b) => {
-    // const nameA = normalize(getValue(a, ["Name", "NAME", "User Name"]));
-    // const nameB = normalize(getValue(b, ["Name", "NAME", "User Name"]));
-    // if (nameA !== nameB) return nameA.localeCompare(nameB);
-
-    const pnA = normalize(getValue(a, ["PN", "Pn", "pn"]));
-    const pnB = normalize(getValue(b, ["PN", "Pn", "pn"]));
-    if (pnA !== pnB) return pnA.localeCompare(pnB);
-
-    const divA = normalize(getValue(a, ["Divisi", "DIVISI", "Division"]));
-    const divB = normalize(getValue(b, ["Divisi", "DIVISI", "Division"]));
-    if (divA !== divB) return divA.localeCompare(divB);
-
-    const locA = normalize(getValue(a, ["Lokasi", "LOKASI", "Location"]));
-    const locB = normalize(getValue(b, ["Lokasi", "LOKASI", "Location"]));
-    if (locA !== locB) return locA.localeCompare(locB);
-
-    return 0;
+    return score(b) - score(a);
   });
 }
 
