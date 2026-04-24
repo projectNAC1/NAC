@@ -488,10 +488,7 @@ export default function App() {
       await pauseUi();
 
       const sortedRows = sortRowsByQuality(dedupedRows);
-      sortedRows.forEach((row, index) => {
-        row["No"] = index + 1;
-      });
-
+      
       setStatus("Writing Excel file...");
       await pauseUi();
 
@@ -510,6 +507,38 @@ export default function App() {
       const blob = new Blob([buffer], {
         type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       });
+
+      // console.log("=== SAMPLE ROW ===");
+// console.table(sortedRows.slice(0, 5));
+
+        sortedRows.forEach((row, index) => {
+          row["No"] = index + 1;
+        });
+
+        const batchSize = 100;
+
+        for (let i = 0; i < sortedRows.length; i += batchSize) {
+          const chunk = sortedRows.slice(i, i + batchSize);
+          console.log(sortedRows[0])
+
+          try {
+            const response = await fetch("http://localhost:8000/api/master-data", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ data: chunk }),
+            });
+
+            const result = await response.json();
+
+            const batchNumber = Math.floor(i / batchSize) + 1;
+            console.log(`Batch ${batchNumber} success`, result);
+          } catch (error) {
+            const batchNumber = Math.floor(i / batchSize) + 1;
+            console.error(`Batch ${batchNumber} error`, error);
+          }
+        }
 
       saveAs(blob, "master.xlsx");
       setStatus(`Done. Exported ${sortedRows.length} rows to master.xlsx`);
@@ -1383,17 +1412,24 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
   }
 
   if (headerNorm === "fullname") {
-    return (
-      getValueFromRow(context.rolloutMatchBySerial, [
-        "full name",
-        "fullname",
-        "employee name",
-        "name",
-        "user name",
-        "username",
-      ]) || ""
-    );
-  }
+  return (
+    getValueFromRow(context.rolloutRow, [
+      "Fullname",
+      "Full Name",
+      "fullname",
+      "employee name",
+      "name",
+      "user name",
+      "username",
+    ]) ||
+    getValueFromRow(context.deviceMatchByMac, [
+      "Fullname",
+      "Full Name",
+      "name",
+    ]) ||
+    ""
+  );
+}
 
   if (headerNorm === "checkboarding") {
     return context.boardingMatch ? "Posturing+Boarding" : "No Boarding";
@@ -1568,12 +1604,25 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
   }
 
   if (headerNorm === "hostname") {
-    return (
-      getValueFromRow(context.deviceMatchByMac, ["hostname", "device name"]) ||
-      getValueFromRow(context.softwareMatch, ["hostname", "device name"]) ||
-      getValueFromRow(context.rolloutRow, ["hostname device"])
-    );
-  }
+  return (
+    getValueFromRow(context.rolloutRow, [
+      "Host Name",
+      "hostname",
+      "device name",
+    ]) ||
+    getValueFromRow(context.deviceMatchByMac, [
+      "Host Name",
+      "hostname",
+      "device name",
+    ]) ||
+    getValueFromRow(context.softwareMatch, [
+      "Host Name",
+      "hostname",
+      "device name",
+    ]) ||
+    ""
+  );
+}
 
   const exactValue = findMatchingHeaderValue(header, sourcePriority);
   if (String(exactValue ?? "").trim() !== "") return exactValue;
@@ -1698,82 +1747,99 @@ function sortRowsByQuality(rows: GenericRow[]) {
 const styles: Record<string, CSSProperties> = {
   page: {
     minHeight: "100vh",
-    padding: 24,
-    background: "#f5f7fb",
+    padding: 30,
+    background: "linear-gradient(135deg, #0f172a, #1e293b)",
+    color: "#fff",
   },
+
   card: {
     maxWidth: 1200,
     margin: "0 auto",
-    background: "#fff",
-    padding: 24,
-    borderRadius: 16,
-    boxShadow: "0 8px 30px rgba(0,0,0,0.08)",
+    background: "#111827",
+    padding: 30,
+    borderRadius: 20,
+    boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
   },
+
   title: {
     margin: 0,
-    marginBottom: 8,
-    fontSize: 28,
+    marginBottom: 10,
+    fontSize: 32,
+    fontWeight: "bold",
   },
+
   subtitle: {
-    marginTop: 0,
-    color: "#4b5563",
+    color: "#9ca3af",
+    fontSize: 14,
+    lineHeight: 1.6,
   },
+
   notice: {
-    marginTop: 12,
-    background: "#eef2ff",
-    border: "1px solid #c7d2fe",
-    color: "#3730a3",
-    padding: 12,
+    marginTop: 16,
+    background: "#1e40af",
+    padding: 14,
     borderRadius: 10,
+    fontSize: 13,
   },
+
   grid: {
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
-    gap: 16,
-    marginTop: 24,
+    gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+    gap: 20,
+    marginTop: 30,
   },
+
   fileBox: {
-    border: "1px solid #e5e7eb",
-    borderRadius: 12,
-    padding: 16,
-    background: "#fafafa",
+    background: "#1f2937",
+    borderRadius: 14,
+    padding: 20,
+    border: "1px solid #374151",
+    transition: "0.3s",
   },
+
   label: {
     display: "block",
-    fontWeight: 700,
-    marginBottom: 8,
+    fontWeight: 600,
+    marginBottom: 10,
   },
+
   fileName: {
-    marginTop: 8,
-    fontSize: 13,
-    color: "#6b7280",
-    wordBreak: "break-word",
+    marginTop: 10,
+    fontSize: 12,
+    color: "#9ca3af",
   },
+
   actions: {
     display: "flex",
     alignItems: "center",
-    gap: 16,
-    marginTop: 24,
+    gap: 20,
+    marginTop: 30,
     flexWrap: "wrap",
   },
+
   button: {
-    border: 0,
-    borderRadius: 10,
-    background: "#2563eb",
+    border: "none",
+    borderRadius: 12,
+    background: "linear-gradient(135deg, #2563eb, #3b82f6)",
     color: "#fff",
-    padding: "12px 18px",
+    padding: "14px 22px",
     cursor: "pointer",
     fontWeight: 700,
+    fontSize: 15,
+    transition: "0.3s",
   },
+
   counter: {
-    color: "#374151",
+    color: "#9ca3af",
   },
+
   status: {
-    marginTop: 18,
-    padding: 12,
-    background: "#eff6ff",
-    border: "1px solid #bfdbfe",
-    borderRadius: 10,
-    color: "#1d4ed8",
+    marginTop: 20,
+    padding: 14,
+    borderRadius: 12,
+    background: "#1f2937",
+    border: "1px solid #374151",
+    color: "#38bdf8",
+    fontSize: 14,
   },
 };
