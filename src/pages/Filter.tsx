@@ -1,23 +1,48 @@
 import { useEffect, useState } from "react";
 import * as XLSX from "xlsx";
 import { saveAs } from "file-saver";
+import { getMasterData, exportMasterData } from "../api/api";
 
 export default function Filter() {
   const [data, setData] = useState<any[]>([]);
-  const [date, setSearch] = useState("");
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [loading, setLoading] = useState(false);
 
+  useEffect(() => {
+    setPage(1);
+  }, [startDate, endDate]);
+
+  // 🔥 FETCH DATA
+  useEffect(() => {
+  setLoading(true);
+
+  getMasterData(page, startDate, endDate)
+    .then((res) => {
+      setData(res.data);
+      setTotalPages(res.totalPages);
+    })
+    .catch((err) => {
+      console.error("FETCH ERROR:", err);
+      setData([]);
+    })
+    .finally(() => setLoading(false));
+}, [page, startDate, endDate]);
+
   // 🔥 EXPORT EXCEL
-  const exportToExcel = () => {
-    if (filteredData.length === 0) {
+  const exportToExcel = async () => {
+  try {
+    const allData = await exportMasterData(startDate, endDate);
+
+    if (allData.length === 0) {
       alert("Tidak ada data untuk di export");
       return;
     }
 
-    const exportData = filteredData.map((item) => ({
-      No: item.no,
+    const exportData = allData.map((item: any, i: number) => ({
+      No: i + 1,
       Fullname: item.fullname,
       PN: item.pn,
       Divisi: item.divisi,
@@ -38,7 +63,6 @@ export default function Filter() {
 
     const worksheet = XLSX.utils.json_to_sheet(exportData);
     const workbook = XLSX.utils.book_new();
-
     XLSX.utils.book_append_sheet(workbook, worksheet, "Master Data");
 
     const excelBuffer = XLSX.write(workbook, {
@@ -50,45 +74,28 @@ export default function Filter() {
       type: "application/octet-stream",
     });
 
-    saveAs(file, `master_data_${date || "all"}.xlsx`);
-  };
+    saveAs(
+      file,
+      `master_data_${startDate || "all"}_${endDate || "all"}.xlsx`
+    );
 
-  // 🔥 FETCH DATA
-  useEffect(() => {
-    setLoading(true);
-
-    fetch(`http://localhost:8000/api/master-data?page=${page}`)
-      .then(res => res.json())
-      .then(res => {
-        if (Array.isArray(res)) {
-          setData(res);
-          setTotalPages(1);
-        } else if (res.data) {
-          setData(res.data);
-          setTotalPages(res.totalPages || 1);
-        } else {
-          setData([]);
-        }
-      })
-      .catch(err => {
-        console.error("FETCH ERROR:", err);
-        setData([]);
-      })
-      .finally(() => setLoading(false));
-  }, [page]);
+  } catch (err) {
+    console.error("EXPORT ERROR:", err);
+  }
+};
 
   // 🔥 FILTER
-  const filteredData = data.filter(item => {
-    const keyword = date.toLowerCase();
+  const filteredData = data.filter((item) => {
+    if (!startDate && !endDate) return true;
 
-    return (
-      item.fullname?.toLowerCase().includes(keyword) ||
-      item.pn?.toLowerCase().includes(keyword) ||
-      item.divisi?.toLowerCase().includes(keyword) ||
-      item.lokasi?.toLowerCase().includes(keyword) ||
-      item.device_type?.toLowerCase().includes(keyword) ||
-      formatDate(item.date).toLowerCase().includes(keyword)
-    );
+    const itemDate = new Date(item.date);
+    const start = startDate ? new Date(startDate) : null;
+    const end = endDate ? new Date(endDate) : null;
+
+    if (start && itemDate < start) return false;
+    if (end && itemDate > end) return false;
+
+    return true;
   });
 
   return (
@@ -96,23 +103,27 @@ export default function Filter() {
       <h1 style={styles.title}>📊 Master Data</h1>
 
       {/* 🔍 SEARCH + EXPORT */}
-      <div style={{ display: "flex", gap: "10px", marginBottom: "20px" }}>
+      <div style={styles.topBar}>
         <input
+          type="date"
+          value={startDate}
+          onChange={(e) => setStartDate(e.target.value)}
           style={styles.input}
-          placeholder="Cari nama / PN / divisi / tanggal..."
-          value={date}
-          onChange={(e) => setSearch(e.target.value)}
+        />
+
+        <input
+          type="date"
+          value={endDate}
+          onChange={(e) => setEndDate(e.target.value)}
+          style={styles.input}
         />
 
         <button
           onClick={exportToExcel}
-          disabled={filteredData.length === 0}
+          disabled={loading}
           style={{
-            background: filteredData.length === 0 ? "#999" : "green",
-            color: "#fff",
-            border: "none",
-            padding: "10px 16px",
-            borderRadius: "8px",
+            ...styles.exportBtn,
+            background: filteredData.length === 0 ? "#999" : "#16a34a",
             cursor: filteredData.length === 0 ? "not-allowed" : "pointer"
           }}
         >
@@ -128,56 +139,48 @@ export default function Filter() {
         <table style={styles.table}>
           <thead style={styles.thead}>
             <tr>
-              <th>No</th>
-              <th>Fullname</th>
-              <th>PN</th>
-              <th>Divisi</th>
-              <th>Lokasi</th>
-              <th>Lantai</th>
-              <th>Host</th>
-              <th>SN</th>
-              <th>MAC</th>
-              <th>Device</th>
-              <th>Boarding</th>
-              <th>Manual</th>
-              <th>Posturing</th>
-              <th>Group</th>
-              <th>XDR</th>
-              <th>Reason</th>
-              <th>Date</th>
+              {headers.map((h) => (
+                <th key={h} style={styles.cellHeader}>{h}</th>
+              ))}
             </tr>
           </thead>
 
           <tbody>
             {filteredData.length > 0 ? (
-              filteredData.map((item) => (
-                <tr key={item.no}>
-                  <td>{item.no}</td>
-                  <td>{item.fullname || "-"}</td>
-                  <td>{item.pn || "-"}</td>
-                  <td>{item.divisi || "-"}</td>
-                  <td>{item.lokasi || "-"}</td>
-                  <td>{item.lantai || "-"}</td>
-                  <td>{item.host_name || "-"}</td>
-                  <td>{item.sn || "-"}</td>
-                  <td>{item.mac || "-"}</td>
-                  <td>{item.device_type || "-"}</td>
-                  <td>{item.boarding || "-"}</td>
-                  <td>{item.boarding_manual || "-"}</td>
+              filteredData.map((item, index) => (
+                <tr
+                  key={item.no}
+                  style={index % 2 === 0 ? styles.row : styles.rowAlt}
+                >
+                  <td style={styles.cell}>{index + 1}</td>
+                  <td style={styles.cell}>{item.fullname || "-"}</td>
+                  <td style={styles.cell}>{item.pn || "-"}</td>
+                  <td style={styles.cell}>{item.divisi || "-"}</td>
+                  <td style={styles.cell}>{item.lokasi || "-"}</td>
+                  <td style={styles.cell}>{item.lantai || "-"}</td>
+                  <td style={styles.cell}>{item.host_name || "-"}</td>
+                  <td style={styles.cell}>{item.sn || "-"}</td>
+                  <td style={styles.cell}>{item.mac || "-"}</td>
+                  <td style={styles.cell}>{item.device_type || "-"}</td>
+                  <td style={styles.cell}>{item.boarding || "-"}</td>
+                  <td style={styles.cell}>{item.boarding_manual || "-"}</td>
 
-                  <td style={getStatusStyle(item.posturing_boarding)}>
+                  <td style={{
+                    ...styles.cell,
+                    ...getStatusStyle(item.posturing_boarding)
+                  }}>
                     {item.posturing_boarding || "-"}
                   </td>
 
-                  <td>{item.div_by_group || "-"}</td>
-                  <td>{item.xdr || "-"}</td>
-                  <td>{item.reason || "-"}</td>
-                  <td>{formatDate(item.date)}</td>
+                  <td style={styles.cell}>{item.div_by_group || "-"}</td>
+                  <td style={styles.cell}>{item.xdr || "-"}</td>
+                  <td style={styles.cell}>{item.reason || "-"}</td>
+                  <td style={styles.cell}>{formatDate(item.date)}</td>
                 </tr>
               ))
             ) : (
               <tr>
-                <td colSpan={17} style={{ textAlign: "center" }}>
+                <td colSpan={17} style={{ textAlign: "center", padding: 20 }}>
                   Tidak ada data
                 </td>
               </tr>
@@ -196,9 +199,7 @@ export default function Filter() {
           ⬅ Prev
         </button>
 
-        <span>
-          Page {page} / {totalPages}
-        </span>
+        <span>Page {page} / {totalPages}</span>
 
         <button
           disabled={page >= totalPages}
@@ -212,10 +213,15 @@ export default function Filter() {
   );
 }
 
+// 🔥 HEADER LIST
+const headers = [
+  "No","Fullname","PN","Divisi","Lokasi","Lantai","Host","SN","MAC",
+  "Device","Boarding","Manual","Posturing","Group","XDR","Reason","Date"
+];
+
 // 🔥 FORMAT DATE
 function formatDate(date: any) {
   if (!date) return "-";
-
   try {
     return new Date(date).toLocaleDateString("id-ID");
   } catch {
@@ -236,9 +242,16 @@ const styles = {
   container: {
     padding: "30px",
     fontFamily: "Arial",
+    background: "#f3f4f6",
+    minHeight: "100vh"
   },
   title: {
     marginBottom: "20px",
+  },
+  topBar: {
+    display: "flex",
+    gap: "10px",
+    marginBottom: "20px"
   },
   input: {
     padding: "10px",
@@ -246,22 +259,46 @@ const styles = {
     borderRadius: "8px",
     border: "1px solid #ccc",
   },
+  exportBtn: {
+    color: "#fff",
+    border: "none",
+    padding: "10px 16px",
+    borderRadius: "8px",
+  },
   tableWrapper: {
     width: "100%",
-    overflowX: "scroll" as const,
+    overflowX: "auto" as const,
     background: "#fff",
     borderRadius: "10px",
     padding: "10px",
+    boxShadow: "0 4px 10px rgba(0,0,0,0.05)"
   },
   table: {
-    width: "max-content",
-    minWidth: "100%",
+    width: "100%",
     borderCollapse: "collapse" as const,
+    fontSize: "14px",
   },
   thead: {
     position: "sticky" as const,
     top: 0,
-    background: "#eee",
+    background: "#3b82f6",
+  },
+  cellHeader: {
+    padding: "12px",
+    color: "#fff",
+    textAlign: "center" as const,
+  },
+  cell: {
+    padding: "10px 14px",
+    textAlign: "center" as const,
+    borderBottom: "1px solid #eee",
+    whiteSpace: "nowrap" as const,
+  },
+  row: {
+    backgroundColor: "#fff",
+  },
+  rowAlt: {
+    backgroundColor: "#f9fafb",
   },
   pagination: {
     marginTop: "20px",
