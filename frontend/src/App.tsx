@@ -157,7 +157,7 @@ export default function App() {
       }
 
       const masterHeaders = ensureDateHeaderAfterReasonNotComply(
-        extractHeaders(masterRowsRaw),
+        extractHeaders(masterRowsRaw as any),
       );
       setStatus("Preparing source data...");
       await pauseUi();
@@ -694,21 +694,21 @@ async function readAllSheets(file: File): Promise<SheetRows[]> {
 
     let rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
 
-    if (!looksLikeRealData(rows)) {
+    if (!looksLikeRealData(rows as any)) {
       rows = XLSX.utils.sheet_to_json(sheet, { defval: "", range: 1 });
     }
 
-    if (!looksLikeRealData(rows)) {
+    if (!looksLikeRealData(rows as any)) {
       rows = XLSX.utils.sheet_to_json(sheet, { defval: "", range: 2 });
     }
 
-    if (!looksLikeRealData(rows)) {
+    if (!looksLikeRealData(rows as any)) {
       rows = XLSX.utils.sheet_to_json(sheet, { defval: "", range: 3 });
     }
 
     return {
       sheetName,
-      rows: cleanupRows(rows),
+      rows: cleanupRows(rows as any),
     };
   });
 }
