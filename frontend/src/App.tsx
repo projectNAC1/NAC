@@ -28,23 +28,6 @@ type CheckleakStatus = {
   xdrInstalled: boolean;
 };
 
-// type MergeContext = {
-//   rowNumber: number;
-//   keyRecord: MasterKeyRecord;
-//   rolloutRow: GenericRow | null;
-//   boardingMatch: GenericRow | null;
-//   softwareMatch: GenericRow | null;
-//   checkleakMatch: GenericRow | null;
-//   deviceMatchByMac: GenericRow | null;
-//   matchedDeviceBySerial: GenericRow | null;
-//   serialValue: string;
-//   candidateMacs: string[];
-//   boardingUsernameByMac: Map<string, string>;
-//   checkleakStatusByMac: Map<string, CheckleakStatus>;
-//   rolloutPnValue: string;
-//   rolloutMatchBySerial: GenericRow | null;
-// };
-
 type MergeContext = {
   rowNumber: number;
   keyRecord: MasterKeyRecord;
@@ -60,8 +43,11 @@ type MergeContext = {
   candidateMacs: string[];
   boardingUsernameByMac: Map<string, string>;
   checkleakStatusByMac: Map<string, CheckleakStatus>;
+  boardingPnValue: string;
+  boardingDateValue: unknown;
   rolloutPnValue: string;
   rolloutMatchBySerial: GenericRow | null;
+  rolloutMatchByPn: GenericRow | null;
 };
 
 const FILE_KEYS = {
@@ -159,6 +145,7 @@ export default function App() {
       const masterHeaders = ensureDateHeaderAfterReasonNotComply(
         extractHeaders(masterRowsRaw as any),
       );
+
       setStatus("Preparing source data...");
       await pauseUi();
 
@@ -205,6 +192,28 @@ export default function App() {
         "lan mac",
       ]);
 
+      const boardingPnKey = detectColumn(boardingRows, [
+        "pn",
+        "personal number",
+        "personnel number",
+        "nik",
+        "employee id",
+        "employee number",
+        "user name",
+        "username",
+        "email",
+      ]);
+
+      const boardingDateKey = detectColumn(boardingRows, [
+        "date",
+        "tgl",
+        "tanggal",
+        "created date",
+        "createddate",
+        "time",
+        "datetime",
+      ]);
+
       const softwareMacKey = detectColumn(softwareRows, [
         "mac address",
         "mac",
@@ -221,6 +230,7 @@ export default function App() {
         "asset serial",
         "bios serial number",
       ]);
+
       const checkleakMacKey = detectColumn(checkleakRows, [
         "mac address",
         "mac",
@@ -236,9 +246,9 @@ export default function App() {
         "wireless mac",
         "lan mac",
       ]);
-
       const deviceListSerialKey = detectColumn(deviceListRows, [
         "bios serial number",
+        "motherboard serial number",
         "serial number",
         "serialnumber",
         "sn",
@@ -261,6 +271,10 @@ export default function App() {
         normalizeMacKeys: true,
       });
 
+      const rolloutIndexByPn = indexRowsByNormalizedPn(rolloutRows, [
+        rolloutPnKey,
+      ]);
+
       const boardingIndexByMac = indexRowsByKeys(
         boardingRows,
         [boardingMacKey],
@@ -276,6 +290,7 @@ export default function App() {
           normalizeMacKeys: true,
         },
       );
+
       const softwareIndexBySerial = indexRowsByKeys(
         softwareRows,
         [softwareSerialKey],
@@ -314,7 +329,10 @@ export default function App() {
       );
 
       const boardingUsernameByMac = buildBoardingUsernameIndex(boardingRows);
-      const boardingIndexByPn = buildBoardingPnIndex(boardingRows);
+      const boardingIndexByPn = buildBoardingPnIndex(
+        boardingRows,
+        boardingPnKey,
+      );
 
       setStatus("Building unified device identities...");
       await pauseUi();
@@ -358,92 +376,170 @@ export default function App() {
               ? (deviceListIndexBySerial.get(keyRecord.serial) ?? null)
               : null;
 
-          const rolloutBySerial =
-            keyRecord.serial && rolloutIndexBySerial.has(keyRecord.serial)
-              ? (rolloutIndexBySerial.get(keyRecord.serial) ?? null)
+          const initialCandidateMacs = dedupeStrings([
+            keyRecord.mac,
+            ...collectPossibleMacs([matchedDeviceBySerial]),
+          ]);
+
+          const deviceMatchByMac = findFirstMacMatch(
+            initialCandidateMacs,
+            deviceListIndexByMac,
+          );
+
+          const softwareMatchByMac = findFirstMacMatch(
+            [keyRecord.mac],
+            softwareIndexByMac,
+          );
+          // 1) Software Installation match dulu ke Device List untuk ambil Serial Number.
+          const softwareMatchBySerialNumber =
+            keyRecord.serial && softwareIndexBySerial.has(keyRecord.serial)
+              ? (softwareIndexBySerial.get(keyRecord.serial) ?? null)
               : null;
 
-          const rolloutByMac =
-            keyRecord.mac && rolloutIndexByMac.has(keyRecord.mac)
-              ? (rolloutIndexByMac.get(keyRecord.mac) ?? null)
-              : null;
+          // const softwareMatchByMac = findFirstMacMatch(
+          //   initialCandidateMacs,
+          //   softwareIndexByMac,
+          // );
 
-          const rolloutRow = rolloutBySerial || rolloutByMac || null;
+          const softwareMatch =
+            softwareMatchBySerialNumber || softwareMatchByMac;
 
-          const candidateMacs = dedupeStrings([
+          // const serialValue =
+          //   keyRecord.serial ||
+          //   normalizeText(
+          //     getCell(matchedDeviceBySerial, deviceListSerialKey) ||
+          //       getCell(deviceMatchByMac, deviceListSerialKey) ||
+          //       getCell(softwareMatch, softwareSerialKey),
+          //   );
+
+          const detectedDeviceTypeForSerial = detectDeviceTypeFromRows([
+            deviceMatchByMac,
+            matchedDeviceBySerial,
+            softwareMatchByMac,
+            softwareMatchBySerialNumber,
+          ]);
+
+          const serialFromDeviceListByOs = getDeviceListSerialByOs(
+            deviceMatchByMac || matchedDeviceBySerial,
+            detectedDeviceTypeForSerial,
+            deviceListSerialKey,
+          );
+
+          const serialValue =
+            serialFromDeviceListByOs ||
+            normalizeText(getCell(softwareMatchByMac, softwareSerialKey)) ||
+            keyRecord.serial;
+
+          const serialForMatch = normalizeSerialForCompare(serialValue);
+
+          // 2) Setelah identitas gabungan terbentuk, match ke Boarding untuk ambil PN dan tanggal.
+          const candidateMacsBeforeRollout = dedupeStrings([
             keyRecord.mac,
             ...collectPossibleMacs([
-              rolloutRow,
               matchedDeviceBySerial,
-              rolloutByMac,
-              rolloutBySerial,
+              deviceMatchByMac,
+              softwareMatch,
+              softwareMatchByMac,
+              softwareMatchBySerialNumber,
             ]),
           ]);
 
-          const rolloutPnValue = normalizePn(
-            getValueFromRow(rolloutRow, [
-              rolloutPnKey || "",
+          const boardingMatchByMac = findFirstMacMatch(
+            candidateMacsBeforeRollout,
+            boardingIndexByMac,
+          );
+
+          const boardingMatchByPnFromSoftware = (() => {
+            const pn = normalizePn(
+              getValueFromRow(softwareMatch, [
+                "pn",
+                "personal number",
+                "personnel number",
+                "nik",
+                "employee id",
+                "employee number",
+                "user name",
+                "username",
+                "email",
+              ]),
+            );
+
+            return pn && boardingIndexByPn.has(pn)
+              ? (boardingIndexByPn.get(pn) ?? null)
+              : null;
+          })();
+
+          const boardingMatch =
+            boardingMatchByPnFromSoftware || boardingMatchByMac;
+
+          const boardingPnValue = normalizePn(
+            getValueFromRow(boardingMatch, [
+              boardingPnKey || "",
               "pn",
               "personal number",
               "personnel number",
               "nik",
               "employee id",
               "employee number",
+              "user name",
+              "username",
+              "email",
             ]),
           );
 
-          const boardingMatchByMac = findFirstMacMatch(
-            candidateMacs,
-            boardingIndexByMac,
-          );
+          const boardingDateValue = getValueFromRow(boardingMatch, [
+            boardingDateKey || "",
+            "date",
+            "tgl",
+            "tanggal",
+            "created date",
+            "createddate",
+            "time",
+            "datetime",
+          ]);
 
-          const boardingMatchByPn =
-            rolloutPnValue && boardingIndexByPn.has(rolloutPnValue)
-              ? (boardingIndexByPn.get(rolloutPnValue) ?? null)
+          // 3) Match ke Rollout pakai PN dari Boarding untuk ambil fullname, divisi, lokasi, lantai.
+          const rolloutByPn =
+            boardingPnValue && rolloutIndexByPn.has(boardingPnValue)
+              ? (rolloutIndexByPn.get(boardingPnValue) ?? null)
               : null;
 
-          const boardingMatch = boardingMatchByPn || boardingMatchByMac;
-
-          // const softwareMatchBySerial =
-          //   keyRecord.serial && softwareIndexBySerial.has(keyRecord.serial)
-          //     ? (softwareIndexBySerial.get(keyRecord.serial) ?? null)
-          //     : null;
-
-          // const softwareMatchByMac = findFirstMacMatch(
-          //   candidateMacs,
-          //   softwareIndexByMac,
-          // );
-
-          // const softwareMatch = softwareMatchBySerial || softwareMatchByMac;
-
-          const softwareMatchBySerialNumber =
-            keyRecord.serial && softwareIndexBySerial.has(keyRecord.serial)
-              ? (softwareIndexBySerial.get(keyRecord.serial) ?? null)
+          const rolloutBySerial =
+            serialForMatch && rolloutIndexBySerial.has(serialForMatch)
+              ? (rolloutIndexBySerial.get(serialForMatch) ?? null)
               : null;
 
-          const softwareMatchByMac = findFirstMacMatch(
-            candidateMacs,
-            softwareIndexByMac,
+          const rolloutByMac = findFirstMacMatch(
+            candidateMacsBeforeRollout,
+            rolloutIndexByMac,
           );
 
-          const softwareMatch =
-            softwareMatchBySerialNumber || softwareMatchByMac;
+          const rolloutRow =
+            rolloutByPn || rolloutBySerial || rolloutByMac || null;
 
+          const rolloutPnValue =
+            normalizePn(
+              getValueFromRow(rolloutRow, [
+                rolloutPnKey || "",
+                "pn",
+                "personal number",
+                "personnel number",
+                "nik",
+                "employee id",
+                "employee number",
+              ]),
+            ) || boardingPnValue;
+
+          const candidateMacs = dedupeStrings([
+            ...candidateMacsBeforeRollout,
+            ...collectPossibleMacs([rolloutRow, rolloutByMac, rolloutBySerial]),
+          ]);
+
+          // 4) Checkleak by MAC untuk ambil status XDR.
           const checkleakMatch = findFirstMacMatch(
             candidateMacs,
             checkleakIndexByMac,
           );
-          const deviceMatchByMac = findFirstMacMatch(
-            candidateMacs,
-            deviceListIndexByMac,
-          );
-
-          const serialValue =
-            keyRecord.serial ||
-            normalizeText(
-              getCell(rolloutRow, rolloutSerialKey) ||
-                getCell(matchedDeviceBySerial, deviceListSerialKey),
-            );
 
           const merged: GenericRow = {};
 
@@ -455,8 +551,8 @@ export default function App() {
               rolloutMatchBySerial: rolloutBySerial,
               boardingMatch,
               softwareMatch,
-              softwareMatchByMac, // new
-              softwareMatchBySerialNumber, // new
+              softwareMatchByMac,
+              softwareMatchBySerialNumber,
               checkleakMatch,
               deviceMatchByMac,
               matchedDeviceBySerial,
@@ -464,7 +560,10 @@ export default function App() {
               candidateMacs,
               boardingUsernameByMac,
               checkleakStatusByMac,
+              boardingPnValue,
+              boardingDateValue,
               rolloutPnValue,
+              rolloutMatchByPn: rolloutByPn,
             });
           }
 
@@ -488,9 +587,13 @@ export default function App() {
       await pauseUi();
 
       const sortedRows = sortRowsByQuality(dedupedRows);
-      
+
       setStatus("Writing Excel file...");
       await pauseUi();
+
+      sortedRows.forEach((row, index) => {
+        row["No"] = index + 1;
+      });
 
       const outputWb = XLSX.utils.book_new();
       const outputWs = XLSX.utils.json_to_sheet(sortedRows, {
@@ -508,37 +611,31 @@ export default function App() {
         type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       });
 
-      // console.log("=== SAMPLE ROW ===");
-// console.table(sortedRows.slice(0, 5));
+      const batchSize = 100;
 
-        sortedRows.forEach((row, index) => {
-          row["No"] = index + 1;
-        });
+      for (let i = 0; i < sortedRows.length; i += batchSize) {
+        const chunk = sortedRows.slice(i, i + batchSize);
 
-        const batchSize = 100;
-
-        for (let i = 0; i < sortedRows.length; i += batchSize) {
-          const chunk = sortedRows.slice(i, i + batchSize);
-          console.log(sortedRows[0])
-
-          try {
-            const response = await fetch("http://localhost:8000/api/master-data", {
+        try {
+          const response = await fetch(
+            "http://localhost:8000/api/master-data",
+            {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
               },
               body: JSON.stringify({ data: chunk }),
-            });
+            },
+          );
 
-            const result = await response.json();
-
-            const batchNumber = Math.floor(i / batchSize) + 1;
-            console.log(`Batch ${batchNumber} success`, result);
-          } catch (error) {
-            const batchNumber = Math.floor(i / batchSize) + 1;
-            console.error(`Batch ${batchNumber} error`, error);
-          }
+          const result = await response.json();
+          const batchNumber = Math.floor(i / batchSize) + 1;
+          console.log(`Batch ${batchNumber} success`, result);
+        } catch (error) {
+          const batchNumber = Math.floor(i / batchSize) + 1;
+          console.error(`Batch ${batchNumber} error`, error);
         }
+      }
 
       saveAs(blob, "master.xlsx");
       setStatus(`Done. Exported ${sortedRows.length} rows to master.xlsx`);
@@ -566,38 +663,31 @@ export default function App() {
           <br />
           Priority:
           <br />
-          1. Device List
+          1. Software Installation match Device List
           <br />
-          2. Software Information
+          2. Boarding
           <br />
-          3. System Checkleak
+          3. Rollout
           <br />
-          4. Boarding
-          <br />
-          5. Rollout
+          4. Checkleak
           <br />
           <br />
           Rules:
           <br />
-          - Master rows built from all files
+          - Software Installation akan match dulu ke Device List ambil Serial
+          Number
           <br />
-          - Serial Number first, MAC fallback
+          - Setelah identitas gabungan terbentuk, match ke Boarding ambil PN dan
+          tanggal
+          <br />
+          - Rollout match pakai PN dari Boarding ambil Fullname, Divisi, Lokasi,
+          dan Lantai
+          <br />
+          - Checkleak match by MAC mengambil XDR
           <br />
           - MAC matching ignores ":" and "-"
           <br />
           - Output MAC uses ":"
-          <br />
-          - PN compare from Rollout and Boarding
-          <br />
-          - Boarding matched by PN first, MAC fallback
-          <br />
-          - 1 PN can have many devices
-          <br />
-          - Final output dedupe by device only
-          <br />
-          - Divisi by Grouping from Software Installation Department Name
-          <br />
-          - XDR from Checkleak Vulnerability description
           <br />
           - Empty values become #N/A
           <br />- Invalid MACs are ignored
@@ -743,10 +833,12 @@ function cleanupRows(rows: GenericRow[]) {
 
 function normalizeRowKeys(row: GenericRow) {
   const normalized: GenericRow = {};
+
   for (const [key, value] of Object.entries(row)) {
     const cleanKey = String(key ?? "").trim();
     normalized[cleanKey] = value ?? "";
   }
+
   return normalized;
 }
 
@@ -800,6 +892,7 @@ function detectColumn(rows: GenericRow[], possibleNames: string[]) {
   if (!rows.length) return null;
 
   const allKeys = new Set<string>();
+
   for (const row of rows.slice(0, 100)) {
     Object.keys(row).forEach((k) => allKeys.add(k));
   }
@@ -836,18 +929,19 @@ function normalizePn(value: unknown) {
   const text = String(value ?? "")
     .trim()
     .toUpperCase();
+
   if (!text) return "";
 
   const base = text.includes("@") ? text.split("@")[0] : text;
   const compact = base.replace(/\s+/g, "");
 
-  // numeric PN: remove leading zeros
   if (/^\d+$/.test(compact)) {
     return compact.replace(/^0+/, "") || "0";
   }
 
   return compact;
 }
+
 function normalizeMacForCompare(value: unknown) {
   if (!value) return "";
 
@@ -883,6 +977,7 @@ function formatDateOnly(value: unknown) {
 
   if (typeof value === "number" && Number.isFinite(value)) {
     const parsed = XLSX.SSF.parse_date_code(value);
+
     if (parsed) {
       return formatDateParts(parsed.y, parsed.m, parsed.d);
     }
@@ -892,6 +987,7 @@ function formatDateOnly(value: unknown) {
   if (!text) return "";
 
   const pureDateMatch = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+
   if (pureDateMatch) {
     return formatDateParts(
       Number(pureDateMatch[1]),
@@ -901,6 +997,7 @@ function formatDateOnly(value: unknown) {
   }
 
   const ddmmyyyyMatch = text.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+
   if (ddmmyyyyMatch) {
     return formatDateParts(
       Number(ddmmyyyyMatch[3]),
@@ -910,6 +1007,7 @@ function formatDateOnly(value: unknown) {
   }
 
   const parsedDate = new Date(text);
+
   if (!Number.isNaN(parsedDate.getTime())) {
     return formatDateParts(
       parsedDate.getFullYear(),
@@ -944,6 +1042,123 @@ function getCell(row: GenericRow | null, key: string | null) {
   return row[key] ?? "";
 }
 
+function detectDeviceTypeFromRows(rows: Array<GenericRow | null>) {
+  const text = rows
+    .map((row) =>
+      String(
+        getValueFromRow(row, [
+          "Operating System",
+          "OS",
+          "Device Type",
+          "Platform",
+          "Device",
+          "device",
+          "model",
+          "device model",
+          "merk",
+          "brand",
+          "type",
+          "tipe",
+          "Host Name",
+          "hostname",
+          "device name",
+        ]) || "",
+      ),
+    )
+    .join(" ")
+    .toLowerCase();
+
+  if (
+    text.includes("windows") ||
+    text.includes("desktop") ||
+    text.includes("laptop") ||
+    text.includes("z2-") ||
+    text.includes("pc-")
+  ) {
+    return "Windows";
+  }
+
+  if (
+    text.includes("macbook") ||
+    text.includes("mac book") ||
+    text.includes("macos") ||
+    text.includes("mac os")
+  ) {
+    return "MacOS";
+  }
+
+  if (
+    text.includes("iphone") ||
+    text.includes("ipad") ||
+    text.includes("ios")
+  ) {
+    return "IOS";
+  }
+
+  if (
+    text.includes("android") ||
+    text.includes("samsung") ||
+    text.includes("galaxy") ||
+    text.includes("oppo") ||
+    text.includes("vivo") ||
+    text.includes("xiaomi") ||
+    text.includes("redmi") ||
+    text.includes("realme") ||
+    text.includes("huawei")
+  ) {
+    return "Android";
+  }
+
+  return "";
+}
+
+function getDeviceListSerialByOs(
+  deviceRow: GenericRow | null,
+  detectedOs: string,
+  fallbackSerialKey: string | null,
+) {
+  if (!deviceRow) return "";
+
+  const os = String(detectedOs || "")
+    .trim()
+    .toLowerCase();
+
+  if (os === "windows") {
+    return normalizeText(
+      getValueFromRow(deviceRow, [
+        "BIOS Serial Number",
+        "bios serial number",
+        "biosserialnumber",
+      ]),
+    );
+  }
+
+  if (os === "macos") {
+    return normalizeText(
+      getValueFromRow(deviceRow, [
+        "Motherboard Serial Number",
+        "motherboard serial number",
+        "motherboardserialnumber",
+        "logic board serial number",
+      ]),
+    );
+  }
+
+  return normalizeText(
+    getValueFromRow(deviceRow, [
+      fallbackSerialKey || "",
+      "Serial Number",
+      "serial number",
+      "serialnumber",
+      "SN",
+      "service tag",
+      "asset serial",
+      "BIOS Serial Number",
+      "Motherboard Serial Number",
+    ]),
+  );
+}
+
 function countFilledValues(row: GenericRow) {
   return Object.values(row).filter((v) => {
     const s = String(v ?? "").trim();
@@ -962,6 +1177,7 @@ function indexRowsByKeys(
   for (const row of rows) {
     for (const key of usableKeys) {
       const raw = getCell(row, key);
+
       const normalized = options.normalizeMacKeys
         ? normalizeMacForCompare(raw)
         : normalizeSerialForCompare(raw);
@@ -1012,6 +1228,7 @@ function findFirstMacMatch(
     const row = indexMap.get(mac);
     if (row) return row;
   }
+
   return null;
 }
 
@@ -1027,9 +1244,11 @@ function buildBoardingUsernameIndex(boardingRows: GenericRow[]) {
       "user",
       "login",
     ]);
+
     if (!username) continue;
 
     const macs = collectPossibleMacs([row]);
+
     for (const mac of macs) {
       if (mac && !map.has(mac)) {
         map.set(mac, String(username));
@@ -1040,34 +1259,46 @@ function buildBoardingUsernameIndex(boardingRows: GenericRow[]) {
   return map;
 }
 
-function buildBoardingPnIndex(boardingRows: GenericRow[]) {
+function buildBoardingPnIndex(
+  boardingRows: GenericRow[],
+  boardingPnKey: string | null,
+) {
+  return indexRowsByNormalizedPn(boardingRows, [
+    boardingPnKey,
+    "pn",
+    "personal number",
+    "personnel number",
+    "nik",
+    "employee id",
+    "employee number",
+    "user name",
+    "username",
+    "name",
+    "email",
+    "user",
+    "login",
+  ]);
+}
+
+function indexRowsByNormalizedPn(
+  rows: GenericRow[],
+  candidateKeys: Array<string | null>,
+) {
   const map = new Map<string, GenericRow>();
+  const usableKeys = (candidateKeys || []).filter(Boolean) as string[];
 
-  for (const row of boardingRows) {
-    const rawPn = getValueFromRow(row, [
-      "user name",
-      "username",
-      "name",
-      "email",
-      "user",
-      "login",
-    ]);
+  for (const row of rows) {
+    for (const key of usableKeys) {
+      const raw = getValueFromRow(row, [key]);
+      const normalized = normalizePn(raw);
 
-    const pn = normalizePn(rawPn);
-    if (!pn) continue;
+      if (!normalized) continue;
 
-    const existing = map.get(pn);
+      const existing = map.get(normalized);
 
-    if (!existing) {
-      map.set(pn, row);
-      continue;
-    }
-
-    const existingScore = countFilledValues(existing);
-    const currentScore = countFilledValues(row);
-
-    if (currentScore >= existingScore) {
-      map.set(pn, row);
+      if (!existing || countFilledValues(row) >= countFilledValues(existing)) {
+        map.set(normalized, row);
+      }
     }
   }
 
@@ -1141,6 +1372,7 @@ class DisjointSet {
 
   find(x: string): string {
     this.add(x);
+
     const parent = this.parent.get(x)!;
 
     if (parent !== x) {
@@ -1310,6 +1542,7 @@ function dedupeFinalRowsByDevice(rows: GenericRow[]) {
     const serial = normalizeText(
       row["Serial Number"] ?? row["serial number"] ?? row["SN"] ?? "",
     );
+
     const mac = normalizeMacForCompare(
       row["MAC Address"] ?? row["mac address"] ?? row["MAC"] ?? "",
     );
@@ -1342,9 +1575,9 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
     context.deviceMatchByMac,
     context.matchedDeviceBySerial,
     context.softwareMatch,
-    context.checkleakMatch,
     context.boardingMatch,
     context.rolloutRow,
+    context.checkleakMatch,
   ];
 
   const mergedCheckleakStatus = {
@@ -1400,6 +1633,8 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
   }
 
   if (headerNorm === "pn") {
+    if (context.boardingPnValue) return context.boardingPnValue;
+
     const rolloutPn = normalizePn(context.rolloutPnValue);
     if (rolloutPn) return rolloutPn;
 
@@ -1412,24 +1647,28 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
   }
 
   if (headerNorm === "fullname") {
-  return (
-    getValueFromRow(context.rolloutRow, [
-      "Fullname",
-      "Full Name",
-      "fullname",
-      "employee name",
-      "name",
-      "user name",
-      "username",
-    ]) ||
-    getValueFromRow(context.deviceMatchByMac, [
-      "Fullname",
-      "Full Name",
-      "name",
-    ]) ||
-    ""
-  );
-}
+    return (
+      getValueFromRow(context.rolloutRow, [
+        "Fullname",
+        "Full Name",
+        "fullname",
+        "employee name",
+        "name",
+        "user name",
+        "username",
+      ]) ||
+      getValueFromRow(context.boardingMatch, [
+        "Fullname",
+        "Full Name",
+        "fullname",
+        "employee name",
+        "name",
+        "user name",
+        "username",
+      ]) ||
+      ""
+    );
+  }
 
   if (headerNorm === "checkboarding") {
     return context.boardingMatch ? "Posturing+Boarding" : "No Boarding";
@@ -1460,38 +1699,46 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
 
     return "Posturing+Boarding";
   }
+
   if (headerNorm === "divisibygrouping") {
     return (
+      getValueFromRow(context.rolloutRow, [
+        "department",
+        "department name",
+        "departmentname",
+        "department/unit of device",
+        "department unit of device",
+      ]) ||
       findAnyValue(
         [context.softwareMatch],
         ["department name", "departmentname", "department"],
       ) ||
       findAnyValue(
-        [context.softwareMatchByMac],
-        ["department name", "departmentname", "department"],
+        [context.deviceMatchByMac],
+        [
+          "department name",
+          "departmentname",
+          "department",
+          "department/unit of device",
+          "department unit of device",
+        ],
       ) ||
-      findAnyValue(
-        [context.softwareMatchBySerialNumber],
-        ["department name", "departmentname", "department"],
-      ) ||
-      getValueFromRow(context.deviceMatchByMac, [
-        "department/unit of device",
-        "department unit of device",
-      ]) ||
-      getValueFromRow(context.matchedDeviceBySerial, [
-        "department/unit of device",
-        "department unit of device",
-      ]) ||
-      getValueFromRow([context.rolloutRow], ["Lokasi New"]) ||
-      findAnyValue(
-        [context.checkleakMatch],
-        ["department name", "departmentname", "department"],
-      ) ||
-      findAnyValue(
-        [context.checkleakStatusByMac],
-        ["department name", "departmentname", "department"],
-      )
+      ""
     );
+  }
+
+  if (headerNorm === "lokasi" || headerNorm === "location") {
+    return getValueFromRow(context.rolloutRow, [
+      "Lokasi New",
+      "lokasi",
+      "location",
+      "site",
+      "branch",
+    ]);
+  }
+
+  if (headerNorm === "lantai" || headerNorm === "floor") {
+    return getValueFromRow(context.rolloutRow, ["lantai", "floor", "fl"]);
   }
 
   if (headerNorm === "xdr") {
@@ -1518,23 +1765,13 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
     return "Comply";
   }
 
-  if (headerNorm === "date" || headerNorm === "tgl") {
-    // const rawDate = findAnyValue(sourcePriority, [
-    //   "date",
-    //   "tgl",
-    //   "tanggal",
-    //   "created date",
-    //   "createddate",
-    //   "updated date",
-    //   "updateddate",
-    //   "scan date",
-    //   "scandate",
-    //   "report date",
-    //   "reportdate",
-    //   "install date",
-    //   "installdate",
-    // ]);
+  if (
+    headerNorm === "date" ||
+    headerNorm === "tgl" ||
+    headerNorm === "tanggal"
+  ) {
     const rawDate =
+      context.boardingDateValue ||
       findAnyValue(
         [context.boardingMatch],
         [
@@ -1556,73 +1793,264 @@ function pickValueForMasterHeader(header: string, context: MergeContext) {
         "time",
         "datetime",
       ]);
-
     return formatDateOnly(rawDate);
   }
+
+  // if (
+  //   headerNorm === "ostype" ||
+  //   headerNorm === "os" ||
+  //   headerNorm === "devicetype"
+  // ) {
+  //   const rawType =
+  //     getValueFromRow(context.boardingMatch, [
+  //       "Operating System",
+  //       "device type",
+  //       "platform",
+  //       "os",
+  //     ]) || findAnyValue(sourcePriority, ["device type", "platform", "os"]);
+
+  //   const value = String(rawType || "")
+  //     .trim()
+  //     .toLowerCase();
+
+  //   if (!value) return "";
+
+  //   if (value.includes("android")) return "Android";
+  //   if (value.includes("ios") && value.includes("mac")) return "MacOS/IOS";
+  //   if (value.includes("ios")) return "IOS";
+  //   if (value.includes("mac")) return "MacOS";
+  //   if (value.includes("windows")) return "Windows";
+  //   if (value.includes("server")) return "Server";
+  //   if (value.includes("laptop")) return "Laptop";
+
+  //   return value;
+  // }
 
   if (
     headerNorm === "ostype" ||
     headerNorm === "os" ||
     headerNorm === "devicetype"
   ) {
+    const hostName = String(
+      getValueFromRow(context.rolloutRow, [
+        "Host Name",
+        "hostname",
+        "device name",
+      ]) ||
+        getValueFromRow(context.deviceMatchByMac, [
+          "Host Name",
+          "hostname",
+          "device name",
+        ]) ||
+        getValueFromRow(context.matchedDeviceBySerial, [
+          "Host Name",
+          "hostname",
+          "device name",
+        ]) ||
+        getValueFromRow(context.softwareMatch, [
+          "Host Name",
+          "hostname",
+          "device name",
+        ]) ||
+        "",
+    )
+      .trim()
+      .toLowerCase();
+
+    const deviceModel = String(
+      getValueFromRow(context.rolloutRow, [
+        "Device",
+        "device",
+        "model",
+        "device model",
+        "merk",
+        "brand",
+        "type",
+        "tipe",
+      ]) ||
+        getValueFromRow(context.deviceMatchByMac, [
+          "Device",
+          "device",
+          "model",
+          "device model",
+          "merk",
+          "brand",
+          "type",
+          "tipe",
+        ]) ||
+        getValueFromRow(context.matchedDeviceBySerial, [
+          "Device",
+          "device",
+          "model",
+          "device model",
+          "merk",
+          "brand",
+          "type",
+          "tipe",
+        ]) ||
+        getValueFromRow(context.softwareMatch, [
+          "Device",
+          "device",
+          "model",
+          "device model",
+          "merk",
+          "brand",
+          "type",
+          "tipe",
+        ]) ||
+        getValueFromRow(context.boardingMatch, [
+          "Device",
+          "device",
+          "model",
+          "device model",
+          "merk",
+          "brand",
+          "type",
+          "tipe",
+        ]) ||
+        "",
+    )
+      .trim()
+      .toLowerCase();
+
+    const combinedDeviceText = `${hostName} ${deviceModel}`;
+
+    // Apple mobile / MacBook rules
+    if (
+      combinedDeviceText.includes("macbook") ||
+      combinedDeviceText.includes("mac book") ||
+      combinedDeviceText.includes("mac os") ||
+      combinedDeviceText.includes("macos")
+    ) {
+      return "MacOS";
+    }
+
+    if (
+      combinedDeviceText.includes("iphone") ||
+      combinedDeviceText.includes("ipad") ||
+      combinedDeviceText.includes("ios")
+    ) {
+      return "IOS";
+    }
+
+    // Samsung and common Android brands should be Android
+    if (
+      combinedDeviceText.includes("samsung") ||
+      combinedDeviceText.includes("galaxy") ||
+      combinedDeviceText.includes("android") ||
+      combinedDeviceText.includes("oppo") ||
+      combinedDeviceText.includes("vivo") ||
+      combinedDeviceText.includes("xiaomi") ||
+      combinedDeviceText.includes("redmi") ||
+      combinedDeviceText.includes("realme") ||
+      combinedDeviceText.includes("huawei") ||
+      combinedDeviceText.includes("tab")
+    ) {
+      return "Android";
+    }
+
+    // Windows hostname rules
+    if (
+      hostName.startsWith("desktop") ||
+      hostName.startsWith("laptop") ||
+      hostName.startsWith("pc") ||
+      hostName.startsWith("nb") ||
+      hostName.startsWith("z2") ||
+      hostName.includes("desktop-") ||
+      hostName.includes("laptop-") ||
+      hostName.includes("book")
+    ) {
+      return "Windows";
+    }
+
     const rawType =
+      getValueFromRow(context.deviceMatchByMac, [
+        "Operating System",
+        "device type",
+        "platform",
+        "os",
+      ]) ||
+      getValueFromRow(context.matchedDeviceBySerial, [
+        "Operating System",
+        "device type",
+        "platform",
+        "os",
+      ]) ||
+      getValueFromRow(context.softwareMatch, [
+        "Operating System",
+        "device type",
+        "platform",
+        "os",
+      ]) ||
+      getValueFromRow(context.rolloutRow, [
+        "Operating System",
+        "device type",
+        "platform",
+        "os",
+      ]) ||
       getValueFromRow(context.boardingMatch, [
         "Operating System",
         "device type",
         "platform",
         "os",
-      ]) || findAnyValue(sourcePriority, ["device type", "platform", "os"]);
-    // const rawType =
-    //   getValueFromRow(context.softwareMatch, [
-    //     "Operating System",
-    //     "device type",
-    //     "platform",
-    //     "os",
-    //   ]) ||
-    //   getValueFromRow(context.boardingMatch, [
-    //     "Operating System",
-    //     "device type",
-    //     "platform",
-    //     "os",
-    //   ]);
-    // findAnyValue(sourcePriority, ["device type", "platform", "os"]);
+      ]);
 
     const value = String(rawType || "")
       .trim()
       .toLowerCase();
-
     if (!value) return "";
 
-    if (value.includes("android")) return "Android";
-    if (value.includes("ios") && value.includes("mac")) return "MacOS/IOS";
-    if (value.includes("ios")) return "IOS";
-    if (value.includes("mac")) return "MacOS";
-    if (value.includes("windows")) return "Windows";
-    if (value.includes("server")) return "Server";
-    if (value.includes("laptop")) return "Laptop";
-    return value;
-  }
+    // Jangan biarkan Serial Number masuk ke Device Type
+    const serialLikeValue = value.replace(/[^a-z0-9]/g, "");
 
+    if (
+      serialLikeValue &&
+      (serialLikeValue ===
+        normalizeSerialForCompare(context.serialValue).toLowerCase() ||
+        serialLikeValue ===
+          normalizeSerialForCompare(context.keyRecord.serial).toLowerCase())
+    ) {
+      return "";
+    }
+
+    if (value.includes("windows")) return "Windows";
+    if (value.includes("android")) return "Android";
+    if (value.includes("macbook")) return "MacOS";
+    if (value.includes("mac book")) return "MacOS";
+    if (value.includes("macos")) return "MacOS";
+    if (value.includes("mac os")) return "MacOS";
+    if (value.includes("iphone")) return "IOS";
+    if (value.includes("ipad")) return "IOS";
+    if (value.includes("ios")) return "IOS";
+    if (value.includes("samsung")) return "Android";
+    if (value.includes("galaxy")) return "Android";
+    if (value.includes("server")) return "Server";
+    if (value.includes("laptop")) return "Windows";
+    if (value.includes("desktop")) return "Windows";
+
+    // Kalau value bukan OS/device type yang valid, jangan return raw value
+    return "";
+  }
   if (headerNorm === "hostname") {
-  return (
-    getValueFromRow(context.rolloutRow, [
-      "Host Name",
-      "hostname",
-      "device name",
-    ]) ||
-    getValueFromRow(context.deviceMatchByMac, [
-      "Host Name",
-      "hostname",
-      "device name",
-    ]) ||
-    getValueFromRow(context.softwareMatch, [
-      "Host Name",
-      "hostname",
-      "device name",
-    ]) ||
-    ""
-  );
-}
+    return (
+      getValueFromRow(context.rolloutRow, [
+        "Host Name",
+        "hostname",
+        "device name",
+      ]) ||
+      getValueFromRow(context.deviceMatchByMac, [
+        "Host Name",
+        "hostname",
+        "device name",
+      ]) ||
+      getValueFromRow(context.softwareMatch, [
+        "Host Name",
+        "hostname",
+        "device name",
+      ]) ||
+      ""
+    );
+  }
 
   const exactValue = findMatchingHeaderValue(header, sourcePriority);
   if (String(exactValue ?? "").trim() !== "") return exactValue;
@@ -1692,6 +2120,7 @@ function findLooseHeaderValue(
 
     for (const [key, value] of Object.entries(row)) {
       const keyNorm = normalizeHeader(key);
+
       if (
         String(value ?? "").trim() !== "" &&
         (keyNorm.includes(targetNorm) || targetNorm.includes(keyNorm))
